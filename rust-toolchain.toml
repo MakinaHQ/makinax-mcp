@@ -1,0 +1,13 @@
+# Pin the toolchain so `-D warnings` is REPRODUCIBLE.
+#
+# The fmt/clippy gate was added against a floating `stable`, and CI's stable
+# (1.97.0) was five minors ahead of the dev machine's (1.92.0). Clippy gains
+# lints every release, so the gate went red on `manual_clear` — a lint that did
+# not exist locally — with no code change involved. A gate that fails on
+# someone else's release is not a gate, it is a tripwire.
+#
+# Bumping this is now a deliberate PR that fixes whatever the new lints find,
+# instead of an unrelated branch discovering it at merge time.
+[toolchain]
+channel = "1.97.0"
+components = ["rustfmt", "clippy"]

@@ -1,0 +1,62 @@
+[package]
+name = "makinax-mcp"
+version = "0.1.0"
+edition = "2024"
+description = "MCP server over makinax: read, build, prove, simulate and send calls to a makinaX module"
+license-file = "../../LICENSE"
+publish = false
+
+[lints.clippy]
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+
+[lib]
+name = "makinax_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "makinax-mcp"
+path = "src/main.rs"
+
+[features]
+default = ["write"]
+# Simulation, signing and sending. The read-only build is
+# `--no-default-features`: execute_call and every signing path are compiled
+# out, not switched off at runtime.
+write = ["makinax/write", "makinax/tenderly"]
+
+[dependencies]
+makinax = { path = "../makinax", default-features = false, features = [
+    "schemars",
+    "fetch-kyber",
+    "fetch-odos",
+    "fetch-across",
+    "fetch-cctp",
+] }
+rmcp = { version = "=1.6", features = ["server", "transport-io", "macros", "schemars"] }
+# Same read-class feature set as makinax itself; signing features arrive
+# through `makinax/write` only.
+alloy = { version = "1.1", default-features = false, features = [
+    "contract",
+    "network",
+    "providers",
+    "provider-http",
+    "rpc-types",
+    "json-rpc",
+    "reqwest-rustls-tls",
+    "k256",
+] }
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "io-std", "sync", "time", "fs"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+schemars = "1.0"
+config = { version = "0.15", features = ["toml"] }
+dirs = "5"
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tokio = { version = "1.44", features = ["full", "test-util"] }
+tempfile = "3"
+rmcp = { version = "=1.6", features = ["server", "client", "macros", "schemars", "transport-io"] }

@@ -1,0 +1,32 @@
+# Test fixture for tests/fork_walk.rs: one management instruction, written
+# for the walk. It sets a zero WETH allowance for a synthetic placeholder
+# spender (0x1111…1111, not a real account): a call any Safe can make that
+# moves no funds, so the walk needs no balances, prices or feeds. The root
+# is whatever the loader computes; nothing here pins it.
+
+[tokens."${token_list.base.WETH}"]
+chainId = 8453
+address = "0x4200000000000000000000000000000000000006"
+name = "Wrapped Ether"
+decimals = 18
+symbol = "WETH"
+
+# Command: `approve(state[1], state[0])` (selector 0x095ea7b3), flags 0x01
+# (CALL), on WETH. Both state words are fixed (bitmap bits 0 and 1).
+[instructions.weth.approve."Zero allowance"]
+position_id = "1"
+description = "Zero WETH allowance for a placeholder spender"
+is_debt = false
+group_id = "0"
+instruction_type = 0
+affected_tokens = ["0x4200000000000000000000000000000000000006"]
+position_tokens = []
+commands = [
+  "0x095ea7b3010100ffffffffff4200000000000000000000000000000000000006",
+]
+state = [
+  "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "0x0000000000000000000000001111111111111111111111111111111111111111",
+]
+bitmap = "255211775190703847597530955573826158592"
+inputs_slots = []

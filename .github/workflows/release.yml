@@ -1,0 +1,345 @@
+name: release
+# Tagged releases with prebuilt binaries. Tag `vX.Y.Z` (or `vX.Y.Z-rc.N` for a
+# prerelease). Artifacts: `<name>-<target-triple>.tar.xz` for makinax-mcp and
+# makinax-mcp-readonly, on aarch64-apple-darwin and x86_64-unknown-linux-gnu,
+# plus ONE SHA256SUMS covering every tarball and a BUILD-INFO naming the commit.
+#
+# gnu, not musl: the dependency tree has no OpenSSL (rustls everywhere), so
+# glibc is the only dynamic link. A binary built on ubuntu-24.04 (glibc 2.39)
+# does not run on older images.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  # A `permissions:` block makes every unlisted scope `none`. The gate reads
+  # workflow runs to prove ci is green on the tagged commit, which needs this.
+  actions: read
+
+jobs:
+  # A `v*` tag used to trigger a release from ANY commit on ANY branch, with
+  # no tests — shipped bytes nothing ever gated. The tagged commit must be an
+  # ancestor of main AND have a successful ci run (the push-to-main ci fires
+  # concurrently with this workflow, so wait for it rather than requiring it
+  # to have already finished).
+  gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tagged commit is an ancestor of main
+        run: |
+          set -euo pipefail
+          git fetch origin main --quiet
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag $GITHUB_REF_NAME points at $GITHUB_SHA, which is NOT on main — refusing to release untested bytes" >&2
+            exit 1
+          fi
+      - name: Wait for a green ci run on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # "ci is not green yet" and "I am not allowed to look at ci" are
+          # different failures and must never share a branch. Collapsing them
+          # is what made the first v0.6.0 attempt wait the full 20 minutes and
+          # then assert "no successful ci run appeared" while a green one
+          # existed on that very commit. An API error is FATAL AND IMMEDIATE;
+          # only a genuinely absent-or-unfinished run is worth waiting on.
+          for i in $(seq 1 40); do
+            if ! RUNS=$(gh run list --workflow=ci.yml --commit "$GITHUB_SHA" \
+                          --json conclusion,status 2>&1); then
+              echo "::error::cannot READ ci runs for $GITHUB_SHA — this is an API/permissions failure, NOT a red ci. The workflow needs 'actions: read'. gh said: ${RUNS}" >&2
+              exit 1
+            fi
+            CONCLUSION=$(printf '%s' "$RUNS" | jq -r '
+              .[0] | if . == null then "absent"
+                     elif .status == "completed" then (.conclusion // "empty")
+                     else "pending" end')
+            case "$CONCLUSION" in
+              success) echo "ci is green on $GITHUB_SHA"; exit 0 ;;
+              failure|cancelled|timed_out) echo "::error::ci concluded '$CONCLUSION' on $GITHUB_SHA — refusing to release" >&2; exit 1 ;;
+              absent|pending|empty) echo "ci on $GITHUB_SHA: $CONCLUSION (waiting, $i/40)"; sleep 30 ;;
+              *) echo "::error::unhandled ci state '$CONCLUSION' on $GITHUB_SHA — refusing to guess" >&2; exit 1 ;;
+            esac
+          done
+          echo "::error::ci was reachable but no run reached 'success' for $GITHUB_SHA within 20 minutes (last state: ${CONCLUSION})" >&2
+          exit 1
+
+  build:
+    needs: gate
+    strategy:
+      matrix:
+        include:
+          - os: macos-15 # Apple Silicon (the macos-14 runner image is no longer offered)
+            triple: aarch64-apple-darwin
+          - os: ubuntu-24.04
+            triple: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned: shipped bytes come from the compiler every gate ran.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
+      - uses: Swatinem/rust-cache@v2
+
+      # --locked: the release resolves exactly the committed Cargo.lock, the
+      # dependency set the gates tested.
+      - name: Build both variants (release)
+        run: |
+          cargo build --release --locked -p makinax-mcp --bin makinax-mcp
+          cp target/release/makinax-mcp makinax-mcp
+          cargo build --release --locked -p makinax-mcp --bin makinax-mcp --no-default-features
+          cp target/release/makinax-mcp makinax-mcp-readonly
+
+      # The no-signing-code proof runs against the exact bytes being shipped.
+      - name: Assert the shipped read-only binary links no signing code
+        run: ./scripts/assert-readonly.sh ./makinax-mcp-readonly
+
+      - name: Verify variants and version
+        run: |
+          set -euo pipefail
+          RW="$(./makinax-mcp --version)"
+          RO="$(./makinax-mcp-readonly --version)"
+          echo "$RW"; echo "$RO"
+          # The version must match the tag exactly, prerelease suffix
+          # included: the formula url is built from it.
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          SHA="$(git rev-parse --short=12 HEAD)"
+          [ "$RW" = "makinax-mcp ${TAG_VER} (${SHA}) [read-write]" ] || {
+            echo "::error::read-write binary reports '$RW', expected 'makinax-mcp ${TAG_VER} (${SHA}) [read-write]'"; exit 1; }
+          [ "$RO" = "makinax-mcp ${TAG_VER} (${SHA}) [read-only]" ] || {
+            echo "::error::read-only binary reports '$RO', expected 'makinax-mcp ${TAG_VER} (${SHA}) [read-only]'"; exit 1; }
+
+      # A binary that never ran on its target platform is not a release.
+      # Offline: `tools` lists the surface without a config or an RPC.
+      - name: Smoke-run both binaries
+        run: |
+          set -euo pipefail
+          ./makinax-mcp tools > rw-tools.json
+          ./makinax-mcp-readonly tools > ro-tools.json
+          grep -q '"execute_call"' rw-tools.json
+          if grep -q '"execute_call"' ro-tools.json; then
+            echo "::error::the read-only binary lists execute_call"; exit 1
+          fi
+          grep -q '"get_module_state"' ro-tools.json
+          rm -f rw-tools.json ro-tools.json
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          TRIPLE=${{ matrix.triple }}
+          mkdir -p dist share/skills
+          # The agent skill travels with the binary.
+          cp -R crates/makinax-mcp/skills/makinax share/skills/
+          # The read-only tarball keeps the distinct binary name, so `tar -tf`
+          # says which variant it is; the formula installs it as makinax-mcp.
+          tar -cJf "dist/makinax-mcp-readonly-${TRIPLE}.tar.xz" makinax-mcp-readonly share
+          tar -cJf "dist/makinax-mcp-${TRIPLE}.tar.xz" makinax-mcp share
+
+      # Install each formula against the tarball just built, into the
+      # runner's clean prefix, and run the formula's own test block.
+      - name: Install-smoke the packaged formulas (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          ./scripts/install-smoke.sh "dist/makinax-mcp-${{ matrix.triple }}.tar.xz" packaging/homebrew/makinax-mcp.rb
+          ./scripts/install-smoke.sh "dist/makinax-mcp-readonly-${{ matrix.triple }}.tar.xz" packaging/homebrew/makinax-mcp-readonly.rb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.triple }}
+          path: dist/*.tar.xz
+          retention-days: 3
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # ONE SHA256SUMS across every triple.
+      - name: Checksums + build info
+        run: |
+          set -euo pipefail
+          ls -l dist/
+          # Four tarballs: {rw,readonly} x {darwin-arm64, linux-x86_64}.
+          [ "$(ls dist/*.tar.xz | wc -l)" -eq 4 ]
+          (cd dist && sha256sum *.tar.xz > SHA256SUMS)
+          # The dist repo holds artifacts, not source: publish the build
+          # commit as data alongside the checksums.
+          printf 'commit=%s\ntag=%s\n' "$GITHUB_SHA" "$GITHUB_REF_NAME" > dist/BUILD-INFO
+          cat dist/SHA256SUMS dist/BUILD-INFO
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PRERELEASE=""
+          [[ "$GITHUB_REF_NAME" == *-* ]] && PRERELEASE="--prerelease"
+          # Idempotent: a re-run of a failed release must not die here, and
+          # --clobber never leaves two different binaries under one version.
+          # Only an existing release is tolerated (gh-release-create.sh);
+          # any other creation failure fails the step.
+          ./scripts/gh-release-create.sh "$GITHUB_REF_NAME" \
+            $PRERELEASE \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Prebuilt makinax-mcp binaries (macOS arm64 + Linux x86_64). Verify: \`shasum -a 256 -c SHA256SUMS\` (or \`sha256sum -c\`). \`makinax-mcp --version\` prints version, commit and variant. The read-only tarballs cannot sign or send by construction."
+          gh release upload "$GITHUB_REF_NAME" --clobber dist/*
+
+      # ── PUBLIC distribution ────────────────────────────────────────────────
+      #
+      # The formulas and the install instructions point at a separate PUBLIC
+      # repo that carries no source and is also the Homebrew tap, so the
+      # binaries go there as well as to this repository's own release.
+      #
+      # DIST_REPO_TOKEN must be a fine-grained PAT (or GitHub App installation
+      # token) with `contents: write` on the dist repo and nothing else. The
+      # built-in GITHUB_TOKEN cannot write to another repo.
+      #
+      # This step FAILS the release when the token is missing or unauthorised;
+      # it never degrades to "published here only".
+      - name: Publish binaries to the public distribution repo
+        env:
+          DIST_REPO_TOKEN: ${{ secrets.DIST_REPO_TOKEN }}
+          DIST_REPO: MakinaHQ/homebrew-makinax-mcp
+        run: |
+          set -euo pipefail
+          if [ -z "${DIST_REPO_TOKEN:-}" ]; then
+            echo "::error::DIST_REPO_TOKEN is not set. Binaries would exist ONLY in this repository's release, which no formula points at, so brew install would 404 for every user. Create a fine-grained PAT with contents:write on ${DIST_REPO} and add it as the DIST_REPO_TOKEN secret." >&2
+            exit 1
+          fi
+          export GH_TOKEN="$DIST_REPO_TOKEN"
+          # Fail on a token that exists but cannot write, rather than
+          # half-published at the upload.
+          if ! gh api "repos/${DIST_REPO}" --jq '.permissions.push' | grep -q true; then
+            echo "::error::DIST_REPO_TOKEN cannot write to ${DIST_REPO}. It needs contents:write on that repo." >&2
+            exit 1
+          fi
+          PRERELEASE=""
+          [[ "$GITHUB_REF_NAME" == *-* ]] && PRERELEASE="--prerelease"
+          # Notes go through a file; every heredoc line carries the same YAML
+          # indent, and the sed below strips it.
+          cat > /tmp/dist-notes.md <<NOTES
+          Prebuilt makinax-mcp binaries (macOS arm64 + Linux x86_64), built
+          from the source repository at \`${GITHUB_SHA}\`.
+
+          macOS:
+          NOTES
+          if [ -n "$PRERELEASE" ]; then
+          cat >> /tmp/dist-notes.md <<NOTES
+
+          This is a PRERELEASE. Download \`makinax-mcp-aarch64-apple-darwin.tar.xz\`
+          from this release and extract it. The Homebrew tap tracks stable
+          releases only.
+          NOTES
+          else
+          cat >> /tmp/dist-notes.md <<NOTES
+
+              brew install makinahq/makinax-mcp/makinax-mcp
+          NOTES
+          fi
+          cat >> /tmp/dist-notes.md <<NOTES
+
+          Linux: download the tarball directly. Built on ubuntu-24.04
+          (glibc 2.39); older images fail with a GLIBC version error.
+
+          Verify: \`shasum -a 256 -c SHA256SUMS\` (or \`sha256sum -c\`).
+          \`makinax-mcp --version\` prints version, commit and variant.
+
+          Not signed or notarized: the first macOS launch may need Gatekeeper
+          approval.
+          NOTES
+          sed -i'' -e 's/^          //' /tmp/dist-notes.md
+          # Only an existing release is tolerated (gh-release-create.sh).
+          ./scripts/gh-release-create.sh "$GITHUB_REF_NAME" \
+            --repo "$DIST_REPO" \
+            $PRERELEASE \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file /tmp/dist-notes.md
+          gh release upload "$GITHUB_REF_NAME" --repo "$DIST_REPO" --clobber \
+            dist/makinax-mcp-*.tar.xz dist/SHA256SUMS dist/BUILD-INFO
+
+      # The formulas are generated here, from the checksums this job just
+      # published, and committed straight into the tap, so `brew install`
+      # never lags a release.
+      #
+      # STABLE TAGS ONLY. `brew upgrade` reads Formula/ from the tap's default
+      # branch, so rewriting it under an rc would move every user onto a
+      # prerelease. A shell guard rather than a step-level `if:`, so a skip is
+      # reported in the summary instead of rendering as a grey box.
+      - name: Sync the Homebrew tap
+        env:
+          DIST_REPO_TOKEN: ${{ secrets.DIST_REPO_TOKEN }}
+          DIST_REPO: MakinaHQ/homebrew-makinax-mcp
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            # Reported, never silent: a sync that stops happening quietly is
+            # how the staleness this step was built to prevent comes back.
+            {
+              echo "### Homebrew tap NOT synced — ${GITHUB_REF_NAME} is a prerelease"
+              echo
+              echo "The tap serves the stable channel. Syncing it here would rewrite"
+              echo "\`Formula/makinax-mcp.rb\` and move every user onto this RC at their"
+              echo "next \`brew upgrade\`."
+              echo
+              echo "The binaries for this tag ARE published to the release above and stay"
+              echo "installable by anyone who opts in explicitly. The tap moves when a"
+              echo "stable \`vX.Y.Z\` is tagged."
+            } | tee -a "${GITHUB_STEP_SUMMARY:-/dev/stdout}"
+            exit 0
+          fi
+          # Checksums come from the PUBLIC release: the formula's sha256 must
+          # describe the bytes at the formula's url, and this step carries only
+          # DIST_REPO_TOKEN.
+          export GH_TOKEN="$DIST_REPO_TOKEN"
+          MAKINAX_RELEASE_REPO="$DIST_REPO" MAKINAX_DIST_REPO="$DIST_REPO" ./packaging/homebrew/sync-tap.sh "$GITHUB_REF_NAME"
+          # A placeholder that survived means sync-tap.sh silently no-op'd.
+          if grep -q 'sha256 "0\{64\}"' packaging/homebrew/*.rb; then
+            echo "::error::a formula still carries the placeholder checksum after syncing" >&2
+            exit 1
+          fi
+          # Every formula url must name the distribution repo: that is where
+          # this job published the bytes the sha256 describes. A url pointing
+          # anywhere else is a 404 or a checksum mismatch for every user.
+          if grep -h '^ *url "' packaging/homebrew/*.rb | grep -qv "\"https://github.com/${DIST_REPO}/releases/download/"; then
+            echo "::error::a formula url does not point at ${DIST_REPO} — users would get a 404" >&2
+            exit 1
+          fi
+          gh release upload "$GITHUB_REF_NAME" --repo "$DIST_REPO" --clobber \
+            packaging/homebrew/makinax-mcp.rb \
+            packaging/homebrew/makinax-mcp-readonly.rb
+          # Commit into the tap itself: `brew tap` reads Formula/ from the
+          # default branch, not from release assets.
+          # The dist repo is PUBLIC: clone anonymously, so the token never
+          # lands in argv or /tmp/tap/.git/config. The push authenticates via
+          # GIT_ASKPASS reading the token from the environment only.
+          TAP="${TAP_CLONE_DIR:-/tmp/tap}"
+          git clone --depth 1 "https://github.com/${DIST_REPO}.git" "$TAP"
+          printf '#!/bin/sh\ncase "$1" in *Username*) echo x-access-token ;; *) echo "$DIST_REPO_TOKEN" ;; esac\n' > /tmp/git-askpass.sh
+          chmod 700 /tmp/git-askpass.sh
+          mkdir -p "$TAP/Formula"
+          cp packaging/homebrew/makinax-mcp.rb packaging/homebrew/makinax-mcp-readonly.rb "$TAP/Formula/"
+          # The tap's public README rides the same path as the formulas.
+          cp packaging/homebrew/TAP-README.md "$TAP/README.md"
+          cd "$TAP"
+          git config user.name "makinax-release"
+          git config user.email "noreply@makina.finance"
+          # Both paths named: `git add Formula` alone would drop the README.
+          git add Formula README.md
+          if git diff --cached --quiet; then
+            echo "tap already current for ${GITHUB_REF_NAME}"
+          else
+            git commit -m "makinax-mcp ${GITHUB_REF_NAME}"
+            GIT_ASKPASS=/tmp/git-askpass.sh git push origin HEAD
+          fi

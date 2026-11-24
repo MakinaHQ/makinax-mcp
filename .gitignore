@@ -1,0 +1,13 @@
+/target
+.DS_Store
+.claude/
+*.log
+
+# Release artefacts that release.yml writes into the working tree.
+/dist/
+/share/
+/makinax-mcp
+/makinax-mcp-readonly
+
+# Editor and scratch files that have landed at the root before.
+*.docx

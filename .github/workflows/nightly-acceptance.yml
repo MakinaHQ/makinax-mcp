@@ -1,0 +1,32 @@
+name: nightly-acceptance
+# The live checks that need the network and move with the world: real swap
+# quotes against a price band, and the module walk on a fork of Base. Weekdays,
+# plus on demand.
+on:
+  schedule:
+    - cron: "17 3 * * 1-5" # weekdays, off the hour to dodge runner rush
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Install foundry (anvil)
+        uses: foundry-rs/foundry-toolchain@v1
+      # Real Odos and Kyber quotes, nothing sent: the implied ETH price must
+      # sit within 3% of Chainlink ETH/USD. LIVE_RPC_MAINNET overrides the
+      # public mainnet RPC.
+      - name: Live quotes
+        run: cargo test -p makinax --test live_quotes -- --ignored --nocapture
+      # The module walk on an anvil fork of Base (see ci.yml findings-suite).
+      - name: Fork walk
+        run: cargo test -p makinax --test fork_walk -- --ignored --nocapture

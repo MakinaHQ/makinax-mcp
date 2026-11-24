@@ -1,0 +1,9 @@
+# `makinax::Error`'s variants carry their own remediation text, which puts it
+# over clippy's 128-byte default for `result_large_err`. Rather than allow the
+# lint everywhere, this pins a ceiling: the lint stays live, and anything that
+# grows `Error` past it fails CI and has to be justified, by boxing the
+# payload or by raising this number with a note saying why.
+#
+# The lint fires on `>=`, so the threshold is one above the size permitted.
+# Calibrate against `--all-targets`, which is what CI runs.
+large-error-threshold = 177

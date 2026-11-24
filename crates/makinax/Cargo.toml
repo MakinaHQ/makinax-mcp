@@ -1,0 +1,123 @@
+[package]
+name = "makinax"
+version = "0.1.0"
+edition = "2024"
+description = "Neutral library for reading, building and sending calls to a makinaX module"
+license-file = "../../LICENSE"
+publish = false
+
+[lints.clippy]
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+
+[features]
+default = ["write", "tenderly", "fetch-kyber", "fetch-odos", "fetch-across", "fetch-cctp", "fetch-merkl", "mcp"]
+# Write capability: signer construction (local keystore + GCP KMS) and the
+# simulation tooling (warm anvil forks, receipts, gas, traces). A consumer's
+# own read-only build compiles this out with `--no-default-features`.
+write = [
+    "alloy/signer-keystore",
+    "alloy/signer-gcp",
+    "alloy/getrandom",
+    "alloy/node-bindings",
+    "dep:gcloud-sdk",
+    "dep:tokio",
+    "dep:reqwest",
+    "dep:tracing",
+    "dep:dirs",
+    "dep:libc",
+    "dep:async-trait",
+]
+# Tenderly REST simulation client (`sim::tenderly`).
+tenderly = ["write"]
+# The swap-quote trait and best-quote selection (`fetch::quote`), without any
+# built-in vendor adapter — for a caller that brings its own.
+quote = ["dep:tokio", "dep:async-trait"]
+# Built-in fetchers (`fetch::*`), one feature per vendor.
+fetch-kyber = ["quote", "dep:reqwest"]
+fetch-odos = ["quote", "dep:reqwest"]
+fetch-across = ["dep:reqwest"]
+fetch-cctp = ["dep:reqwest", "dep:tracing"]
+fetch-merkl = ["dep:reqwest"]
+# `ext::project_router`: re-home an rmcp tool router onto a caller's own
+# service type.
+mcp = ["dep:rmcp"]
+# `schemars::JsonSchema` for the public enums a consumer exposes in its own
+# tool schemas (e.g. `sim::fork::ExecTarget`).
+schemars = ["dep:schemars"]
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+thiserror = "2"
+eyre = "0.6"
+
+# EVM interaction — read-class features only (same set the root enables
+# unconditionally; signing/wallet features are `write`-gated below).
+alloy = { version = "1.1", default-features = false, features = [
+    "contract",
+    "network",
+    "providers",
+    "provider-http",
+    "rpc-types",
+    "json-rpc",
+    "reqwest-rustls-tls",
+    "k256",
+] }
+alloy-chains = { version = "0.2", features = ["serde"] }
+
+# The hedged-transport service (chain::hedge) is a tower Service, the same
+# trait alloy's transports implement, and fans reads out with join_all.
+futures = "0.3"
+tower = "0.5"
+
+# Write-feature dep: GCP KMS client types re-used from alloy/signer-gcp's
+# graph. default-features off: gcloud-sdk's default `tls-roots` conflicts
+# with the `tls-webpki-roots` alloy-signer-gcp enables.
+gcloud-sdk = { version = "0.29", optional = true, default-features = false, features = [
+    "google-cloud-kms-v1",
+    "google-longrunning",
+    "tls-webpki-roots",
+] }
+
+# Write-feature deps for the simulation tooling: the fork lifecycle runs
+# anvil's blocking startup off the async runtime, health-pings and resets
+# forks over HTTP, and reaps orphaned forks by pid.
+tokio = { version = "1.44", features = ["rt", "time", "macros"], optional = true }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], optional = true }
+tracing = { version = "0.1", optional = true }
+dirs = { version = "5", optional = true }
+libc = { version = "0.2", optional = true }
+schemars = { version = "1.0", optional = true }
+async-trait = { version = "0.1", optional = true }
+# `mcp` feature: the tool-router types `ext::project_router` maps between.
+# Same version and features as any consumer in this workspace, so there is
+# one rmcp in the graph.
+rmcp = { version = "=1.6", features = ["server", "macros", "schemars"], optional = true }
+
+# Rootfile parsing and the canonical merkle tree (`instructions`): the same
+# code that generates a module's on-chain root. Pinned to the same rev as any
+# consumer in this workspace, so there is one leaf/tree implementation.
+transpiler = { git = "https://github.com/MakinaHQ/transpiler.git", rev = "77c13183bbf227231578816aa27db2662de707bc" }
+
+# Feature-unification shim, not used directly: the transpiler crate calls
+# `.query()`/`.json()` on alloy's re-exported reqwest 0.13 without enabling
+# those features itself. Write builds get them transitively via gcloud-sdk
+# (alloy/signer-gcp); a build without `write` must supply them explicitly or
+# transpiler fails to compile.
+reqwest-013 = { package = "reqwest", version = "0.13", default-features = false, features = ["query", "json"] }
+
+[dev-dependencies]
+tokio = { version = "1.44", features = ["full", "test-util"] }
+# Loopback HTTP fixtures for chain::hedge's hedged-transport tests.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+    "query",
+] }
+tempfile = "3"
+rand = "0.8"
+# A real MCP client over an in-memory pipe, for `tests/ext.rs`.
+rmcp = { version = "=1.6", features = ["server", "client", "macros", "schemars", "transport-io"] }
